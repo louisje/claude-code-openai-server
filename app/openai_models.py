@@ -100,6 +100,8 @@ class ResponseMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: Optional[str] = None
     tool_calls: Optional[list[ToolCall]] = None
+    # Non-standard: Claude's extended-thinking text, when captured.
+    reasoning_content: Optional[str] = None
 
 
 class Choice(BaseModel):
@@ -124,6 +126,8 @@ class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[list[ToolCall]] = None
+    # Non-standard: Claude's extended-thinking text, streamed incrementally.
+    reasoning_content: Optional[str] = None
 
 
 class ChunkChoice(BaseModel):

@@ -24,11 +24,12 @@ from app.conversation import (
     ErrorChunk,
     ExpiredContinuation,
     TextChunk,
+    ThinkingChunk,
     ToolBoundaryChunk,
     ToolCallsChunk,
 )
 from app.errors import OpenAIError, error_envelope
-from app.events import AssistantToolUse, Error, TextDelta, TurnDone
+from app.events import AssistantToolUse, Error, TextDelta, ThinkingDelta, TurnDone
 from app.openai_models import ChatCompletionRequest
 from app.textfilter import OutputFilter
 from app.timing import TurnTimer
@@ -40,6 +41,7 @@ from app.translate import (
     map_finish_reason,
     new_completion_id,
     now,
+    reasoning_chunk,
     role_chunk,
     split_system,
     sse,
@@ -141,6 +143,10 @@ async def _stream(
                 if out:
                     timer.first_token()
                     yield sse(text_chunk(cid, model, created, out))
+            elif isinstance(ev, ThinkingDelta):
+                if ev.text:
+                    timer.first_token()
+                    yield sse(reasoning_chunk(cid, model, created, ev.text))
             elif isinstance(ev, TurnDone):
                 tail = joiner.flush()
                 if tail:
@@ -182,6 +188,7 @@ async def _collect(
     timer = TurnTimer(timing, "autonomous")
     completion_tokens = 0
     chunks: list[str] = []
+    reasoning_parts: list[str] = []
     try:
         while True:
             remaining = deadline - loop.time()
@@ -193,11 +200,15 @@ async def _collect(
             if ev is STREAM_CLOSED:
                 chunks.append(joiner.flush())
                 return completion_response(
-                    cid, model, created, content="".join(chunks), finish_reason="stop"
+                    cid, model, created, content="".join(chunks), finish_reason="stop",
+                    reasoning_content="".join(reasoning_parts) or None,
                 )
             if isinstance(ev, TextDelta):
                 timer.first_token()
                 chunks.append(joiner.feed(ev.text))
+            elif isinstance(ev, ThinkingDelta):
+                timer.first_token()
+                reasoning_parts.append(ev.text)
             elif isinstance(ev, TurnDone):
                 chunks.append(joiner.flush())
                 # Prefer the segment-joined text (it carries every text block plus
@@ -212,6 +223,7 @@ async def _collect(
                     content=text,
                     finish_reason=map_finish_reason(ev.stop_reason),
                     usage=usage,
+                    reasoning_content="".join(reasoning_parts) or None,
                 )
             elif isinstance(ev, Error):
                 raise OpenAIError(ev.message, status_code=502, type="upstream_error")
@@ -277,6 +289,10 @@ async def _tool_stream(mgr, conv, cid, model, created, flatten_tables: bool = Tr
                 if out:
                     timer.first_token()
                     yield sse(text_chunk(cid, model, created, out))
+            elif isinstance(ch, ThinkingChunk):
+                if ch.text:
+                    timer.first_token()
+                    yield sse(reasoning_chunk(cid, model, created, ch.text))
             elif isinstance(ch, ToolBoundaryChunk):
                 filt.tool_boundary()
             elif isinstance(ch, ToolCallsChunk):
@@ -310,12 +326,17 @@ async def _tool_collect(mgr, conv, cid, model, created, flatten_tables: bool = T
     timer = TurnTimer(timing, "tool")
     completion_tokens = 0
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     try:
         async for ch in mgr.run_turn(conv):
             if isinstance(ch, TextChunk):
                 if ch.text:
                     timer.first_token()
                 text_parts.append(filt.feed(ch.text))
+            elif isinstance(ch, ThinkingChunk):
+                if ch.text:
+                    timer.first_token()
+                reasoning_parts.append(ch.text)
             elif isinstance(ch, ToolBoundaryChunk):
                 filt.tool_boundary()
             elif isinstance(ch, ToolCallsChunk):
@@ -325,6 +346,7 @@ async def _tool_collect(mgr, conv, cid, model, created, flatten_tables: bool = T
                     content="".join(text_parts) or None,
                     finish_reason="tool_calls",
                     tool_calls=[pc.openai_tool_call() for pc in ch.calls],
+                    reasoning_content="".join(reasoning_parts) or None,
                 )
             elif isinstance(ch, DoneChunk):
                 text_parts.append(filt.flush())
@@ -334,6 +356,7 @@ async def _tool_collect(mgr, conv, cid, model, created, flatten_tables: bool = T
                     content="".join(text_parts),
                     finish_reason=ch.finish_reason,
                     usage=ch.usage or None,
+                    reasoning_content="".join(reasoning_parts) or None,
                 )
             elif isinstance(ch, ErrorChunk):
                 raise OpenAIError(ch.message, status_code=ch.status_code, type="upstream_error")

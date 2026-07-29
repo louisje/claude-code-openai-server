@@ -66,6 +66,13 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ThinkingDelta:
+    """A chunk of Claude's extended-thinking (reasoning) stream."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class AssistantToolUse:
     """A complete assistant message carrying one or more ``tool_use`` blocks."""
 
@@ -124,6 +131,7 @@ class ControlDialog:
 ChatEvent = Union[
     Init,
     TextDelta,
+    ThinkingDelta,
     AssistantToolUse,
     TurnDone,
     Error,
@@ -202,7 +210,7 @@ def _parse_assistant(v: dict[str, Any]) -> Optional[ChatEvent]:
             )
         )
     if not blocks:
-        # Text/thinking-only assistant echo — text already arrived via deltas.
+        # Text/thinking-only assistant echo — content already arrived via deltas.
         return None
     return AssistantToolUse(tool_uses=blocks)
 
@@ -216,12 +224,18 @@ def _parse_stream_event(v: dict[str, Any]) -> Optional[ChatEvent]:
     delta = event.get("delta")
     if not isinstance(delta, dict):
         return None
-    if delta.get("type") != "text_delta":
-        return None
-    text = delta.get("text")
-    if not isinstance(text, str):
-        return None
-    return TextDelta(text)
+    delta_type = delta.get("type")
+    if delta_type == "text_delta":
+        text = delta.get("text")
+        if not isinstance(text, str):
+            return None
+        return TextDelta(text)
+    if delta_type == "thinking_delta":
+        thinking = delta.get("thinking")
+        if not isinstance(thinking, str):
+            return None
+        return ThinkingDelta(thinking)
+    return None
 
 
 def _parse_result(v: dict[str, Any]) -> Optional[ChatEvent]:

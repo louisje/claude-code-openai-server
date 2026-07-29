@@ -15,6 +15,7 @@ from app.events import (
     PermissionRequest,
     QuestionRequest,
     TextDelta,
+    ThinkingDelta,
     TurnDone,
     parse_line,
 )
@@ -137,7 +138,15 @@ def test_blank_nonjson_unknown():
     assert parse_line("   ") is None
     assert parse_line("not json at all") is None
     assert parse_line('{"type":"assistant","message":{}}') is None
-    assert parse_line('{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}') is None
+
+
+def test_thinking_delta_parses():
+    ev = parse_line(
+        '{"type":"stream_event","event":{"type":"content_block_delta",'
+        '"delta":{"type":"thinking_delta","thinking":"hmm"}}}'
+    )
+    assert isinstance(ev, ThinkingDelta)
+    assert ev.text == "hmm"
 
 
 def test_missing_fields_degrade_to_none():

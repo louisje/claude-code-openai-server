@@ -41,6 +41,7 @@ from app.events import (
     PermissionRequest,
     QuestionRequest,
     TextDelta,
+    ThinkingDelta,
     TurnDone,
 )
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
@@ -60,6 +61,13 @@ CLOSED = "closed"
 
 @dataclass
 class TextChunk:
+    text: str
+
+
+@dataclass
+class ThinkingChunk:
+    """A chunk of Claude's extended-thinking (reasoning) text."""
+
     text: str
 
 
@@ -87,7 +95,7 @@ class ToolBoundaryChunk:
     the next text block does not glue onto the previous one."""
 
 
-TurnChunk = Union[TextChunk, ToolCallsChunk, DoneChunk, ErrorChunk, ToolBoundaryChunk]
+TurnChunk = Union[TextChunk, ThinkingChunk, ToolCallsChunk, DoneChunk, ErrorChunk, ToolBoundaryChunk]
 
 
 # ── conversation ────────────────────────────────────────────────────────────
@@ -290,6 +298,8 @@ class ConversationManager:
                     return
                 if isinstance(ev, TextDelta):
                     yield TextChunk(ev.text)
+                elif isinstance(ev, ThinkingDelta):
+                    yield ThinkingChunk(ev.text)
                 elif isinstance(ev, AssistantToolUse):
                     client = ev.client_calls
                     if not client:
