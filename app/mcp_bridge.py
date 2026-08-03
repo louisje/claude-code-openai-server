@@ -44,6 +44,20 @@ logger = logging.getLogger("cci.mcp")
 current_conv_id: ContextVar[str] = ContextVar("current_conv_id", default="")
 
 
+def _peer_is_loopback(client: Optional[tuple]) -> bool:
+    """True when the request's peer address is loopback.
+
+    The ``/mcp`` mount is dialed **only** by the local ``claude`` subprocess over
+    ``http://127.0.0.1`` (see ``ConversationManager._mcp_url``), so legitimate
+    traffic is always loopback. Fails CLOSED: a missing/malformed peer is treated
+    as non-loopback, because ``/mcp`` carries no bearer token and must never be
+    reachable from off-box (the auth middleware gates only ``/v1``)."""
+    if not client:
+        return False
+    host = str(client[0]).strip().lower()
+    return host in {"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"} or host.startswith("127.")
+
+
 class ToolResultError(Exception):
     """Raised inside ``call_tool`` when a pending call is cancelled/expired so the
     error propagates back to Claude instead of hanging."""
@@ -214,6 +228,18 @@ class McpBridge:
 
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] != "http":
+                return
+            # Loopback-only: /mcp is unauthenticated by design and is reached only
+            # by the local claude subprocess. Reject any non-loopback peer so a
+            # non-loopback BIND (permitted when CCI_API_KEY is set) cannot expose
+            # tool enumeration / injection to the network.
+            if not _peer_is_loopback(scope.get("client")):
+                logger.warning("rejecting non-loopback /mcp request from peer=%r",
+                               scope.get("client"))
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body",
+                            "body": b"forbidden: /mcp is loopback-only"})
                 return
             path = scope.get("path", "") or ""
             segments = [s for s in path.split("/") if s]

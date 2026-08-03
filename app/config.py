@@ -45,7 +45,10 @@ class Settings(BaseSettings):
 
     # ── Claude CLI ───────────────────────────────────────────────────────────
     claude_bin: str = "claude"
-    default_model: str = "claude-opus-4-8"
+    # An ALIAS, never a dated concrete id: the CLI resolves "opus" to the current
+    # model, so this default cannot silently go stale (a hardcoded id like
+    # "claude-opus-4-8" does). Override with CCI_DEFAULT_MODEL.
+    default_model: str = "opus"
     default_effort: str | None = None
     permission_mode: str = "bypassPermissions"
     # Force the CLI to inject tool schemas directly rather than behind a
@@ -80,6 +83,17 @@ class Settings(BaseSettings):
 
     # ── MCP bridge ─────────────────────────────────────────────────────────—
     mcp_path_prefix: str = "/mcp"
+
+    # ── Cross-turn session reuse ───────────────────────────────────────────—
+    # When true, a completed conversation is parked (subprocess kept alive)
+    # keyed by a hash of its full history; a later request whose prior turns match
+    # that history reuses the live subprocess and sends only the new user message,
+    # instead of spawning a fresh proc and refolding the whole conversation into
+    # one prompt every turn. Cuts the per-turn history re-billing and preserves
+    # structured tool history. Ships OFF: a positive key match always implies an
+    # identical prefix, and any miss falls back to the refold path, so enabling it
+    # cannot corrupt a conversation — it only trades idle RAM for token savings.
+    cross_turn_reuse: bool = False
 
     # ── Lifecycle / timeouts (seconds) ─────────────────────────────────────—
     request_timeout_s: int = 600
@@ -141,15 +155,25 @@ class Settings(BaseSettings):
 def resolve_model(requested: str | None, settings: Settings) -> str:
     """Map an OpenAI ``model`` field to a value the `claude` CLI accepts.
 
-    Known aliases (opus/sonnet/haiku/…) and any ``claude*`` id pass through;
-    anything else (including ``None`` or empty) falls back to the default model.
+    Known aliases (opus/sonnet/haiku/…) and any ``claude*`` id pass through. An
+    empty/``None`` request uses ``default_model``. An UNRECOGNIZED id raises
+    ``ValueError`` — the caller surfaces it as a 400 — instead of silently
+    downgrading to the default, which would run a different model than the client
+    asked for with no signal (e.g. ``gpt-4o`` quietly becoming the default).
     """
     if not requested:
         return settings.default_model
     r = requested.strip()
+    if not r:
+        return settings.default_model
     if r in KNOWN_MODEL_ALIASES or r.lower().startswith("claude"):
         return r
-    return settings.default_model
+    raise ValueError(
+        f"unknown model {requested!r}: this server speaks the `claude` CLI, so "
+        f"model must be a known alias ({', '.join(sorted(KNOWN_MODEL_ALIASES))}) "
+        f"or a 'claude*' id. Set the client's model accordingly, or leave it "
+        f"empty to use the server default ({settings.default_model!r})."
+    )
 
 
 @lru_cache

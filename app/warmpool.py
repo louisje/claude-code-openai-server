@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -129,8 +130,10 @@ class WarmPool:
         return f"http://127.0.0.1:{self.settings.port}{prefix}/{conv_id}"
 
     def _next_conv_id(self) -> str:
+        # uuid4 suffix, not a unix timestamp: pooled ids share the /mcp namespace
+        # and must be unguessable too. Mirrors ConversationManager._next_conv_id.
         self._counter += 1
-        return f"pool{self._counter}-{int(time.time())}"
+        return f"pool{self._counter}-{uuid.uuid4().hex}"
 
     # ── lifecycle ─────────────────────────────────────────────────────────—
 

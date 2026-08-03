@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +57,7 @@ logger = logging.getLogger("cci.conv")
 RUNNING = "running"
 SUSPENDED = "suspended"
 CLOSED = "closed"
+IDLE = "idle"  # turn complete, subprocess parked alive for cross-turn reuse
 
 
 # ── turn-loop chunks (rendered to SSE / JSON by the chat route) ─────────────—
@@ -109,6 +113,13 @@ class Conversation:
     model: str
     state: str = RUNNING
     last_activity: float = field(default_factory=time.monotonic)
+    # Cross-turn reuse bookkeeping (unused unless settings.cross_turn_reuse):
+    # `current_msgs` is the message list of the request currently being served
+    # (set at create/resume), `reuse_salt` pins the spawn signature, and
+    # `reuse_key` is this conv's key in _idle_by_prefix while parked IDLE.
+    current_msgs: list = field(default_factory=list)
+    reuse_salt: str = ""
+    reuse_key: Optional[str] = None
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -124,6 +135,7 @@ class ConversationManager:
         self.settings = settings
         self._conversations: dict[str, Conversation] = {}
         self._pending_index: dict[str, str] = {}  # tool_call_id -> conv_id
+        self._idle_by_prefix: dict[str, str] = {}  # reuse_key -> conv_id (IDLE convs)
         self._lock = asyncio.Lock()
         self._counter = 0
         # Warm subprocess pool (Phase 2). None unless CCI_WARM_POOL_SIZE > 0, so
@@ -158,12 +170,88 @@ class ConversationManager:
     # ── creation (fresh turn) ─────────────────────────────────────────────—
 
     def _next_conv_id(self) -> str:
+        # The counter keeps ids readable in logs; the uuid4 suffix makes them
+        # unguessable. A predictable id (e.g. counter + unix timestamp) is
+        # enumerable, and the /mcp mount routes purely on it — so an id that can
+        # be guessed is an access-control gap. See also the loopback-peer gate in
+        # McpBridge.asgi_app; this is defense in depth behind it.
         self._counter += 1
-        return f"conv{self._counter}-{int(time.time())}"
+        return f"conv{self._counter}-{uuid.uuid4().hex}"
 
     def _mcp_url(self, conv_id: str) -> str:
         prefix = self.settings.mcp_path_prefix.rstrip("/")
         return f"http://127.0.0.1:{self.settings.port}{prefix}/{conv_id}"
+
+    # ── cross-turn reuse (opt-in) ─────────────────────────────────────────—
+
+    @staticmethod
+    def _norm_msgs(msgs: list[ChatMessage]) -> str:
+        """Serialize the INPUT messages (user + tool) of a history for key
+        matching. Assistant messages are deliberately excluded: they are the
+        subprocess's own outputs, and the client re-sends a *filtered* copy of
+        them (table-flattening, newline seams) that would not byte-match what we
+        generated. The user/tool inputs, by contrast, are echoed verbatim, so
+        keying on them makes a faithful continuation match reliably while two
+        genuinely different conversations still differ. Because we only ever
+        reuse the SAME subprocess, its assistant outputs already equal the
+        client's history by construction — so dropping them from the key loses no
+        safety."""
+        parts: list[str] = []
+        for m in msgs:
+            if m.role not in ("user", "tool"):
+                continue
+            # Serialize list content (content parts) whole, not via message_text:
+            # message_text drops non-text parts, so two histories differing only
+            # in an attached image would otherwise collide on the same key.
+            c = m.content
+            txt = json.dumps(c, sort_keys=True) if isinstance(c, list) else (c or "")
+            tid = getattr(m, "tool_call_id", "") or ""
+            parts.append(f"{m.role}\x1f{txt}\x1f{tid}")
+        return "\x1e".join(parts)
+
+    def _reuse_salt(self, model: str, effort: Optional[str], workdir: Path,
+                    system: str, tools) -> str:
+        """Spawn signature: a subprocess may only be reused for a request that
+        would have spawned an identical one (same model/effort/workdir/system/
+        tools), so these are folded into the key."""
+        return "\x1e".join([
+            model, effort or "", str(workdir), tools_signature(tools), system or "",
+        ])
+
+    def _prefix_key(self, salt: str, msgs: list[ChatMessage]) -> str:
+        return hashlib.sha256((salt + "\x1e" + self._norm_msgs(msgs)).encode("utf-8")).hexdigest()
+
+    async def _try_reuse(
+        self, req: ChatCompletionRequest, *, model: str, workdir: Path, effort: Optional[str],
+    ) -> Optional[Conversation]:
+        """If a parked IDLE conversation has processed exactly this request's
+        prior turns, adopt it and send only the new user message. Returns None
+        (→ caller spawns fresh) on any doubt — a miss is always safe."""
+        if not self.settings.cross_turn_reuse:
+            return None
+        if not req.messages or req.messages[-1].role != "user":
+            return None
+        _, system = split_system(req.messages)
+        salt = self._reuse_salt(model, effort, workdir, system, req.tools)
+        key = self._prefix_key(salt, req.messages[:-1])
+        async with self._lock:
+            cid = self._idle_by_prefix.get(key)
+            conv = self._conversations.get(cid) if cid else None
+            if conv is None or conv.state != IDLE or not conv.session.running:
+                return None
+            # claim it
+            self._idle_by_prefix.pop(key, None)
+            conv.reuse_key = None
+            conv.state = RUNNING
+            conv.current_msgs = list(req.messages)
+            conv.reuse_salt = salt
+            conv.touch()
+        conv.bridge.tools = req.tools or []
+        tail = fold_conversation([req.messages[-1]])  # just the new user message, no history
+        await conv.session.send_user_turn(tail)
+        logger.info("conv=%s REUSED across turns (sent tail only, %d prior msgs skipped)",
+                    conv.conv_id, len(req.messages) - 1)
+        return conv
 
     async def create(
         self,
@@ -173,6 +261,10 @@ class ConversationManager:
         workdir: Path,
         effort: Optional[str],
     ) -> Conversation:
+        reused = await self._try_reuse(req, model=model, workdir=workdir, effort=effort)
+        if reused is not None:
+            return reused
+
         convo, system = split_system(req.messages)
         content = fold_conversation(convo)
 
@@ -194,6 +286,8 @@ class ConversationManager:
                 conv = Conversation(
                     conv_id=entry.conv_id, session=entry.session,
                     bridge=entry.bridge, model=model,
+                    current_msgs=list(req.messages),
+                    reuse_salt=self._reuse_salt(model, effort, workdir, system, req.tools),
                 )
                 async with self._lock:
                     self._conversations[entry.conv_id] = conv
@@ -225,7 +319,11 @@ class ConversationManager:
             **_prompt_kwargs(self.settings, system),
         )
         await session.start()
-        conv = Conversation(conv_id=conv_id, session=session, bridge=bridge, model=model)
+        conv = Conversation(
+            conv_id=conv_id, session=session, bridge=bridge, model=model,
+            current_msgs=list(req.messages),
+            reuse_salt=self._reuse_salt(model, effort, workdir, system, req.tools),
+        )
         async with self._lock:
             self._conversations[conv_id] = conv
         logger.info("conv=%s created (model=%s, %d tools)", conv_id, model, len(req.tools or []))
@@ -255,6 +353,11 @@ class ConversationManager:
                 )
             conv.state = RUNNING
             conv.touch()
+            # The continuation carries the full history the client now holds
+            # (incl. the assistant tool_calls and tool results); record it so a
+            # later cross-turn reuse keys off what the subprocess has actually
+            # processed by the time this turn ends.
+            conv.current_msgs = list(req.messages)
             for tid in ids:
                 self._pending_index.pop(tid, None)
 
@@ -285,16 +388,21 @@ class ConversationManager:
 
     async def run_turn(self, conv: Conversation) -> AsyncIterator[TurnChunk]:
         timeout = self.settings.request_timeout_s
+        # Terminal cleanup (close, or park for reuse) is done BEFORE yielding the
+        # terminal chunk, never after: the route breaks out of this generator as
+        # soon as it receives DoneChunk/ToolCallsChunk/ErrorChunk, so any code
+        # after that `yield` would not run until the generator is GC'd — too late
+        # to park a subprocess for the very next turn to reuse.
         try:
             while True:
                 ev = await conv.session.next_event(timeout=timeout)
                 if ev is None:
-                    yield ErrorChunk("upstream timeout", status_code=504)
                     await self._close(conv)
+                    yield ErrorChunk("upstream timeout", status_code=504)
                     return
                 if ev is STREAM_CLOSED:
+                    await self._close(conv)  # stdout closed => proc gone, not reusable
                     yield DoneChunk("stop", {})
-                    await self._close(conv)
                     return
                 if isinstance(ev, TextDelta):
                     yield TextChunk(ev.text)
@@ -312,12 +420,12 @@ class ConversationManager:
                         continue
                     batch = await self._collect_client_batch(conv, len(client))
                     if batch is None:
-                        yield ErrorChunk("upstream timeout", status_code=504)
                         await self._close(conv)
+                        yield ErrorChunk("upstream timeout", status_code=504)
                         return
                     if not batch:
-                        yield ErrorChunk("expected client tool calls did not arrive", status_code=502)
                         await self._close(conv)
+                        yield ErrorChunk("expected client tool calls did not arrive", status_code=502)
                         return
                     async with self._lock:
                         for pc in batch:
@@ -328,12 +436,12 @@ class ConversationManager:
                     yield ToolCallsChunk(batch)
                     return  # park SUSPENDED; subprocess blocked in call_tool
                 elif isinstance(ev, TurnDone):
+                    await self._park_or_close(conv)  # park for reuse, or close
                     yield DoneChunk(_finish(ev.stop_reason), usage_from_turn(ev))
-                    await self._close(conv)
                     return
                 elif isinstance(ev, Error):
-                    yield ErrorChunk(ev.message, status_code=502)
                     await self._close(conv)
+                    yield ErrorChunk(ev.message, status_code=502)
                     return
                 elif isinstance(ev, (PermissionRequest, QuestionRequest, ControlDialog)):
                     await self._handle_control_event(conv, ev)
@@ -342,7 +450,7 @@ class ConversationManager:
         except asyncio.CancelledError:
             # Client disconnected mid-turn (not at a clean suspend point): tear
             # the conversation down so no subprocess is orphaned.
-            if conv.state != SUSPENDED:
+            if conv.state not in (SUSPENDED, IDLE, CLOSED):
                 await self._close(conv)
             raise
 
@@ -428,6 +536,26 @@ class ConversationManager:
                     with contextlib.suppress(asyncio.CancelledError):
                         await t
 
+    # ── park for reuse ────────────────────────────────────────────────────—
+
+    async def _park_or_close(self, conv: Conversation) -> None:
+        """On a clean turn end: if cross-turn reuse is on and the subprocess is
+        still alive, park it IDLE keyed by the user/tool inputs it has now
+        processed, so a matching next turn can adopt it. Otherwise tear it down
+        as before."""
+        if not self.settings.cross_turn_reuse or not conv.session.running:
+            await self._close(conv)
+            return
+        key = self._prefix_key(conv.reuse_salt, conv.current_msgs)
+        async with self._lock:
+            if conv.state == CLOSED:
+                return
+            conv.state = IDLE
+            conv.reuse_key = key
+            self._idle_by_prefix[key] = conv.conv_id
+        conv.touch()
+        logger.info("conv=%s parked IDLE for cross-turn reuse", conv.conv_id)
+
     # ── teardown ──────────────────────────────────────────────────────────—
 
     async def _close(self, conv: Conversation) -> None:
@@ -437,6 +565,12 @@ class ConversationManager:
         conv.bridge.fail_all("conversation closed")
         async with self._lock:
             self._conversations.pop(conv.conv_id, None)
+            if conv.reuse_key:
+                # Pop only our own index entry: a later conv parked under the
+                # same key overwrites it, and closing us must not strand that one.
+                if self._idle_by_prefix.get(conv.reuse_key) == conv.conv_id:
+                    self._idle_by_prefix.pop(conv.reuse_key)
+                conv.reuse_key = None
             for tid in conv.bridge.pending_ids:
                 self._pending_index.pop(tid, None)
             stale = [tid for tid, cid in self._pending_index.items() if cid == conv.conv_id]
@@ -458,7 +592,9 @@ class ConversationManager:
         A SUSPENDED conversation (a client turn that never returned its tool
         results) past ``suspended_ttl_s`` is killed; failing its pending Futures
         unblocks the subprocess before teardown. Any conversation idle past
-        ``idle_session_ttl_s`` is also evicted.
+        ``idle_session_ttl_s`` is also evicted — this includes IDLE conversations
+        parked for cross-turn reuse, so ``idle_session_ttl_s`` bounds how long a
+        reusable subprocess is kept alive between turns.
         """
         now = time.monotonic()
         susp_ttl = self.settings.suspended_ttl_s

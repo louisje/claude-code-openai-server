@@ -11,6 +11,7 @@ import pytest
 
 from app.conversation import (
     CLOSED,
+    IDLE,
     RUNNING,
     SUSPENDED,
     Conversation,
@@ -365,3 +366,163 @@ async def test_gc_keeps_fresh():
     mgr._conversations["c1"] = conv
     assert await mgr.gc_once() == 0
     assert conv.state == SUSPENDED
+
+
+# ── cross-turn session reuse (opt-in) ────────────────────────────────────────
+
+def _done_events(text):
+    return [TextDelta(text), TurnDone(stop_reason="end_turn",
+                                      usage={"input_tokens": 1, "output_tokens": 1})]
+
+
+async def _drive(mgr, conv):
+    return [c async for c in mgr.run_turn(conv)]
+
+
+async def test_reuse_parks_idle_on_done_when_enabled():
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=True))
+    bridge = ConversationBridge("c1", [])
+    mcp.register(bridge)
+    sess = FakeSession(_done_events("hi there"))
+    conv = Conversation(conv_id="c1", session=sess, bridge=bridge, model="sonnet",
+                        current_msgs=[ChatMessage(role="user", content="hello")],
+                        reuse_salt="salt")
+    mgr._conversations["c1"] = conv
+    await _drive(mgr, conv)
+    # parked, not closed
+    assert conv.state == IDLE
+    assert sess.closed is False
+    assert conv.reuse_key is not None
+    assert mgr._idle_by_prefix.get(conv.reuse_key) == "c1"
+
+
+async def test_no_reuse_closes_on_done_when_disabled():
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=False))
+    bridge = ConversationBridge("c1", [])
+    mcp.register(bridge)
+    sess = FakeSession(_done_events("hi there"))
+    conv = Conversation(conv_id="c1", session=sess, bridge=bridge, model="sonnet",
+                        current_msgs=[ChatMessage(role="user", content="hello")])
+    mgr._conversations["c1"] = conv
+    await _drive(mgr, conv)
+    assert conv.state == CLOSED
+    assert sess.closed is True
+    assert mgr._idle_by_prefix == {}
+
+
+async def test_park_then_reuse_roundtrip_sends_only_tail():
+    """The key computed at park time must equal the key computed at lookup time
+    for a faithful continuation — this is the correctness crux of reuse."""
+    from pathlib import Path
+    workdir = Path("/tmp/ws")
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=True))
+    bridge = ConversationBridge("c1", [])
+    mcp.register(bridge)
+    sess = FakeSession(_done_events("hi there"))
+    salt = mgr._reuse_salt("sonnet", None, workdir, "", [])
+    conv = Conversation(conv_id="c1", session=sess, bridge=bridge, model="sonnet",
+                        current_msgs=[ChatMessage(role="user", content="hello")],
+                        reuse_salt=salt)
+    mgr._conversations["c1"] = conv
+    await _drive(mgr, conv)                      # parks IDLE
+    assert conv.state == IDLE
+
+    # The client continues: full history + a new user turn.
+    r2 = ChatCompletionRequest(model="sonnet", messages=[
+        ChatMessage(role="user", content="hello"),
+        ChatMessage(role="assistant", content="hi there"),
+        ChatMessage(role="user", content="next please"),
+    ])
+    reused = await mgr._try_reuse(r2, model="sonnet", workdir=workdir, effort=None)
+    assert reused is conv
+    assert reused.state == RUNNING
+    assert conv.reuse_key is None
+    assert mgr._idle_by_prefix == {}
+    # only the new user message was sent to the live subprocess (no refold)
+    assert sess.sent_turns == ["next please"]
+
+
+async def test_reuse_miss_on_different_prefix_returns_none():
+    from pathlib import Path
+    workdir = Path("/tmp/ws")
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=True))
+    bridge = ConversationBridge("c1", [])
+    mcp.register(bridge)
+    sess = FakeSession(_done_events("hi there"))
+    salt = mgr._reuse_salt("sonnet", None, workdir, "", [])
+    conv = Conversation(conv_id="c1", session=sess, bridge=bridge, model="sonnet",
+                        current_msgs=[ChatMessage(role="user", content="hello")],
+                        reuse_salt=salt)
+    mgr._conversations["c1"] = conv
+    await _drive(mgr, conv)
+    # A request whose prior turn differs ("HELLO" not "hello") must not match.
+    r2 = ChatCompletionRequest(model="sonnet", messages=[
+        ChatMessage(role="user", content="HELLO"),
+        ChatMessage(role="assistant", content="hi there"),
+        ChatMessage(role="user", content="next"),
+    ])
+    assert await mgr._try_reuse(r2, model="sonnet", workdir=workdir, effort=None) is None
+
+
+async def test_reuse_disabled_never_matches():
+    from pathlib import Path
+    mgr = ConversationManager(McpBridge(), make_settings(cross_turn_reuse=False))
+    r = ChatCompletionRequest(model="sonnet", messages=[ChatMessage(role="user", content="x")])
+    assert await mgr._try_reuse(r, model="sonnet", workdir=Path("/tmp/ws"), effort=None) is None
+
+
+async def test_idle_conv_reaped_by_gc():
+    import time as _time
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=True,
+                                                 suspended_ttl_s=99999, idle_session_ttl_s=60))
+    bridge = ConversationBridge("c1", [])
+    mcp.register(bridge)
+    sess = FakeSession([])
+    conv = Conversation(conv_id="c1", session=sess, bridge=bridge, model="sonnet", state=IDLE)
+    conv.reuse_key = "k1"
+    conv.last_activity = _time.monotonic() - 10_000  # safely past idle_ttl
+    mgr._conversations["c1"] = conv
+    mgr._idle_by_prefix["k1"] = "c1"
+    assert await mgr.gc_once() == 1
+    assert conv.state == CLOSED
+    assert sess.closed is True
+    assert mgr._idle_by_prefix == {}      # idle index cleaned on close
+
+
+def test_reuse_key_distinguishes_image_content():
+    """Histories differing only in an attached image must not share a reuse key
+    (message_text drops image parts; the key serialization must not)."""
+    mgr = ConversationManager(McpBridge(), make_settings(cross_turn_reuse=True))
+    def msgs(img_data):
+        return [ChatMessage(role="user", content=[
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}},
+        ])]
+    assert mgr._prefix_key("s", msgs("AAAA")) != mgr._prefix_key("s", msgs("BBBB"))
+    assert mgr._prefix_key("s", msgs("AAAA")) == mgr._prefix_key("s", msgs("AAAA"))
+
+
+async def test_close_does_not_strand_other_conv_with_same_reuse_key():
+    """conv2 parked under the same key overwrites conv1's index entry; closing
+    conv1 must leave conv2's entry (and reusability) intact."""
+    mcp = McpBridge()
+    mgr = ConversationManager(mcp, make_settings(cross_turn_reuse=True))
+    convs = {}
+    for cid in ("c1", "c2"):
+        bridge = ConversationBridge(cid, [])
+        mcp.register(bridge)
+        conv = Conversation(conv_id=cid, session=FakeSession([]), bridge=bridge,
+                            model="sonnet", state=IDLE)
+        conv.reuse_key = "k1"
+        mgr._conversations[cid] = conv
+        convs[cid] = conv
+    mgr._idle_by_prefix["k1"] = "c2"  # c2 parked later, overwrote c1's entry
+    await mgr._close(convs["c1"])
+    assert mgr._idle_by_prefix == {"k1": "c2"}
+    await mgr._close(convs["c2"])
+    assert mgr._idle_by_prefix == {}

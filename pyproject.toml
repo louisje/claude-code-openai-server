@@ -17,7 +17,7 @@ dependencies = [
     "httptools>=0.6",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "mcp>=1.2,<2.0",
+    "mcp>=1.2,<2",
     "sse-starlette>=2.1",
 ]
 

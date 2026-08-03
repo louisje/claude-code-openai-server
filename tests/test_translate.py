@@ -132,6 +132,36 @@ def test_fold_includes_assistant_tool_calls():
     assert "called tools: get_weather" in folded
 
 
+def test_fold_renders_tool_result_as_prose_and_drops_tool_call_id():
+    """Characterize the KNOWN, ACCEPTED history-refold limitation for a full
+    tool round-trip folded into a fresh subprocess: an assistant tool call
+    becomes '[called tools: fn({...})]', the tool RESULT becomes a 'Tool: <text>'
+    line, and the tool_call_id correlating the two is dropped — structured
+    tool history is flattened to prose. Recorded as a regression characterization
+    (previously the 'Tool:' path had no coverage), not a change of behavior."""
+    convo = [
+        ChatMessage(role="user", content="weather in Paris?"),
+        ChatMessage(
+            role="assistant", content=None,
+            tool_calls=[ToolCall(id="call_abc123",
+                                 function=FunctionCall(name="get_weather",
+                                                       arguments='{"city":"Paris"}'))],
+        ),
+        ChatMessage(role="tool", tool_call_id="call_abc123",
+                    content='{"temp_c":21,"summary":"sunny"}'),
+        ChatMessage(role="user", content="and Berlin?"),
+    ]
+    folded = fold_conversation(convo)
+    # assistant tool call rendered as prose
+    assert '[called tools: get_weather({"city":"Paris"})]' in folded
+    # tool result rendered as a plain 'Tool:' line
+    assert 'Tool: {"temp_c":21,"summary":"sunny"}' in folded
+    # the tool_call_id correlation is NOT preserved anywhere in the fold
+    assert "call_abc123" not in folded
+    # the whole prior turn is re-sent alongside the new one (re-billed each turn)
+    assert "Paris" in folded and folded.rstrip().endswith("and Berlin?")
+
+
 def test_map_finish_reason():
     assert map_finish_reason("end_turn") == "stop"
     assert map_finish_reason("max_tokens") == "length"
