@@ -250,8 +250,10 @@ async def _handle_tools(
 
     if mgr.is_continuation(req):
         try:
-            conv = await mgr.resume(req)
+            conv = await mgr.resume_or_rebuild(req, model=model, workdir=workdir, effort=effort)
         except ExpiredContinuation as e:
+            # Only reached when rebuild_on_expiry is off: keep the legacy 409 so
+            # operators who prefer their client's own failover still get it.
             raise OpenAIError(
                 str(e), status_code=409, type="invalid_request_error", code="tool_result_expired"
             )

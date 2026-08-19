@@ -142,6 +142,45 @@ _CONTINUE_GUARD = (
 )
 
 
+def _history_images(msg: ChatMessage) -> list[dict[str, Any]]:
+    """Image blocks carried by a message, or ``[]``.
+
+    Goes through ``_claude_message_content`` so an image folded from history is
+    validated exactly like one on the live turn (data-URL shape, media type,
+    size cap, base64).
+    """
+    content = _claude_message_content(msg)
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if b.get("type") == "image"]
+
+
+def _render_items(items: list[Any]) -> str | list[dict[str, Any]]:
+    """Render fold items — labelled lines and image blocks — for the wire.
+
+    An all-text fold collapses back to one newline-joined string, the shape the
+    server has always sent. As soon as an image is in play the fold becomes a
+    content-block list instead, with each run of lines merged into a single text
+    block so every image keeps its position in the transcript.
+    """
+    if not any(isinstance(it, dict) for it in items):
+        return "\n".join(items)
+
+    blocks: list[dict[str, Any]] = []
+    run: list[str] = []
+    for it in items:
+        if isinstance(it, dict):
+            if run:
+                blocks.append({"type": "text", "text": "\n".join(run)})
+                run = []
+            blocks.append(it)
+        else:
+            run.append(it)
+    if run:
+        blocks.append({"type": "text", "text": "\n".join(run)})
+    return blocks
+
+
 def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
     """Fold a (system-stripped) OpenAI conversation into one Claude user turn.
 
@@ -151,6 +190,10 @@ def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
     context without reading it as a transcript to continue. A conversation
     ending on a non-user turn is folded entirely into the preamble with a
     continue-style guard instead.
+
+    Images in those prior turns are carried through as content blocks in place,
+    so a refold does not blind the model to a picture it was already shown; a
+    conversation without them folds to exactly the same string as before.
     """
     if not convo:
         return ""
@@ -162,7 +205,7 @@ def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
     # context like every other prior turn.
     history = convo[:-1] if last.role == "user" else convo
 
-    lines: list[str] = []
+    items: list[Any] = []
     for m in history:
         text = message_text(m)
         if m.tool_calls:
@@ -170,24 +213,40 @@ def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
                 f"{tc.function.name}({tc.function.arguments or ''})" for tc in m.tool_calls
             )
             text = (text + " " if text else "") + f"[called tools: {calls}]"
+        images = _history_images(m)
         if text:
-            lines.append(f"{_role_label(m.role)}: {text}")
+            items.append(f"{_role_label(m.role)}: {text}")
+        elif images:
+            # An image-only turn still needs its label, so the blocks that
+            # follow are attributed to the right speaker.
+            items.append(f"{_role_label(m.role)}:")
+        items.extend(images)
 
     if last.role != "user":
-        if not lines:
+        if not items:
             return message_text(last)
-        return _HISTORY_HEADER + "\n" + "\n".join(lines) + "\n\n" + _CONTINUE_GUARD
+        return _render_items([_HISTORY_HEADER, *items, "", _CONTINUE_GUARD])
 
     last_content = _claude_message_content(last)
 
     # No usable prior context: send the latest message alone (nothing to fold).
-    if not lines:
+    if not items:
         return last_content if isinstance(last_content, list) else message_text(last)
 
-    preamble = _HISTORY_HEADER + "\n" + "\n".join(lines) + "\n\n" + _LIVE_GUARD + "\n\n"
+    # Trailing empties reproduce the historical "\n\n" seam before the live turn.
+    preamble = _render_items([_HISTORY_HEADER, *items, "", _LIVE_GUARD, "", ""])
+    if isinstance(preamble, str):
+        if isinstance(last_content, list):
+            return [{"type": "text", "text": preamble}, *last_content]
+        return preamble + message_text(last)
+
+    # History carried images, so the whole fold travels as blocks. An empty live
+    # turn contributes no block: the API rejects an empty text block, and on the
+    # string path it appended nothing anyway.
     if isinstance(last_content, list):
-        return [{"type": "text", "text": preamble}, *last_content]
-    return preamble + message_text(last)
+        return [*preamble, *last_content]
+    tail = message_text(last)
+    return [*preamble, {"type": "text", "text": tail}] if tail.strip() else preamble
 
 
 # ── stop_reason / usage mapping ────────────────────────────────────────────—

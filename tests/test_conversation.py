@@ -17,6 +17,7 @@ from app.conversation import (
     Conversation,
     ConversationManager,
     DoneChunk,
+    DuplicateContinuation,
     ErrorChunk,
     ExpiredContinuation,
     TextChunk,
@@ -245,8 +246,11 @@ async def test_suspend_resume_roundtrip():
     assert conv.state == RUNNING
     # The dispatch Future was resolved with the tool result.
     assert await asyncio.wait_for(dispatch_task, 1) == '{"temp_c":21}'
-    # tool_call_id was consumed from the index.
-    assert call.id not in mgr._pending_index
+    # The id stays indexed on purpose: a re-send of the same continuation is
+    # then recognised as a duplicate (409) instead of looking like an expired
+    # session that rebuild-on-expiry would happily re-run.
+    with pytest.raises(DuplicateContinuation):
+        await mgr.resume(cont)
 
 
 async def test_resume_expired_raises():
@@ -295,7 +299,9 @@ async def test_concurrent_resume_only_one_wins():
     assert len(wins) == 1 and len(rejects) == 1
     assert conv.state == RUNNING
     assert await asyncio.wait_for(task, 1) == '{"temp_c":21}'
-    assert call_id not in mgr._pending_index
+    # The loser is a duplicate, not an expiry — so rebuild-on-expiry leaves it
+    # as a 409 instead of spawning a second subprocess to re-run the turn.
+    assert isinstance(rejects[0], DuplicateContinuation)
 
 
 async def test_partial_continuation_fails_unanswered_calls():

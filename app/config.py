@@ -101,6 +101,18 @@ class Settings(BaseSettings):
     idle_session_ttl_s: int = 900
     gc_interval_s: int = 30
 
+    # ── Expired-continuation recovery ──────────────────────────────────────—
+    # When a tool continuation references a suspended conversation that is gone
+    # (GC'd past suspended_ttl_s, or wiped by a server restart), rebuild a fresh
+    # session from the request's FULL history and answer the turn, instead of
+    # returning HTTP 409. OpenAI clients are stateless: the continuation already
+    # carries the whole transcript (system + user + assistant tool_calls + tool
+    # results), so the rebuild loses nothing. A 409, by contrast, is unretryable
+    # by construction — the session it refers to is physically gone — so clients
+    # that have a fallback model drop the turn onto it, and clients that don't
+    # surface a hard error. Set CCI_REBUILD_ON_EXPIRY=false for the legacy 409.
+    rebuild_on_expiry: bool = True
+
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"
     # When true, emit per-turn latency metrics (spawn_ms / ttft_ms / total_ms /

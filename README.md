@@ -21,6 +21,9 @@ Under the hood it drives `claude` as a persistent subprocess over its
   conversation kept alive across continuations.
 - **Claude's own built-in tools** (Read/Edit/Bash/…) run internally the whole
   time (unless bare mode strips them — see below).
+- **Images:** base64 `image_url` parts become native Claude image blocks — on the
+  live turn and in folded history alike, so a picture stays visible for the
+  follow-up turns that ask about it.
 - **Bare model mode** (default on): presents Claude as a plain model fronted by
   your client — replaces the system prompt, drops Claude Code's dynamic context,
   and exposes only the tools your client sends.
@@ -156,6 +159,7 @@ CCI_TIMING_LOG=false
 | `CCI_SUSPENDED_TTL_S` | `300` | How long a tool-suspended conversation may wait for its results before GC. |
 | `CCI_IDLE_SESSION_TTL_S` | `900` | Idle conversation eviction age. |
 | `CCI_GC_INTERVAL_S` | `30` | GC sweep interval. |
+| `CCI_REBUILD_ON_EXPIRY` | `true` | Rebuild a fresh session from the request's history when tool results arrive for an already-reaped conversation, instead of answering 409. |
 | `CCI_WARM_POOL_SIZE` | `0` | Pre-spawned idle `claude` procs (cold-start removal). 0 = off. |
 | `CCI_LOG_LEVEL` | `INFO` | Log level. |
 | `CCI_TIMING_LOG` | `false` | Emit per-turn latency metrics to the `cci.timing` logger. |
@@ -336,3 +340,8 @@ OpenAI client ──HTTP /v1──▶ cci-server ──stream-json (stdin/stdout
   (carrying the tool results) resolves the pending futures and the same
   subprocess resumes. Matching is by `tool_call_id`.
 - A background GC reaps suspended-too-long and idle conversations.
+- **Expired continuation:** if the tool results come back after their
+  conversation was reaped (a slow tool, a long pause, a server restart), the
+  server rebuilds a fresh session from the history the request already carries
+  and answers the turn normally, rather than failing it with a 409 the client
+  cannot retry. `CCI_REBUILD_ON_EXPIRY=false` restores the 409.

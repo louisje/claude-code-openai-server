@@ -129,6 +129,14 @@ class ExpiredContinuation(Exception):
     """A continuation whose tool_call_ids match no suspended conversation."""
 
 
+class DuplicateContinuation(ExpiredContinuation):
+    """A continuation whose conversation is alive but is not waiting on these
+    tool results — a second copy of a turn already claimed. Distinct from a
+    plain expiry because it must never be rebuilt: the first copy is (or was)
+    answering it, and a rebuild would re-run the whole turn, side effects and
+    all, on a second subprocess. Still renders as 409, as it always did."""
+
+
 class ConversationManager:
     def __init__(self, mcp: McpBridge, settings: Settings) -> None:
         self.mcp = mcp
@@ -347,9 +355,17 @@ class ConversationManager:
         async with self._lock:
             conv_id = next((self._pending_index[i] for i in ids if i in self._pending_index), None)
             conv = self._conversations.get(conv_id) if conv_id else None
-            if conv is None or conv.state != SUSPENDED:
+            if conv is None:
                 raise ExpiredContinuation(
                     "tool results reference an expired or unknown conversation; retry the turn"
+                )
+            # The ids are known but this conversation is not blocked on them:
+            # another copy of this same continuation already claimed the turn
+            # (or the conversation has since suspended on a later batch). That
+            # is what the claim is for — reject, and never rebuild it.
+            if conv.state != SUSPENDED or not set(ids) & set(conv.bridge.pending_ids):
+                raise DuplicateContinuation(
+                    "these tool results were already claimed; the turn is already running"
                 )
             conv.state = RUNNING
             conv.touch()
@@ -358,8 +374,10 @@ class ConversationManager:
             # later cross-turn reuse keys off what the subprocess has actually
             # processed by the time this turn ends.
             conv.current_msgs = list(req.messages)
-            for tid in ids:
-                self._pending_index.pop(tid, None)
+            # The claimed ids stay in the index (``_close`` sweeps them) so a
+            # duplicate copy of this continuation still resolves to this
+            # conversation and is recognised as a duplicate, rather than looking
+            # like an expired session and being rebuilt.
 
         # Deliver results to the per-call Futures (outside the lock).
         outstanding = set(conv.bridge.pending_ids)
@@ -383,6 +401,49 @@ class ConversationManager:
 
         logger.info("conv=%s resumed (%d/%d tool results)", conv.conv_id, resolved, len(tool_msgs))
         return conv
+
+    # ── resume-or-rebuild (expired-continuation recovery) ─────────────────—
+
+    async def resume_or_rebuild(
+        self,
+        req: ChatCompletionRequest,
+        *,
+        model: str,
+        workdir: Path,
+        effort: Optional[str],
+    ) -> Conversation:
+        """Resume a suspended conversation, or rebuild it from full history.
+
+        The happy path is :meth:`resume`: match the trailing tool results to the
+        live suspended subprocess and hand them over. If that subprocess is gone
+        (GC'd past ``suspended_ttl_s``, or wiped by a restart), ``resume`` raises
+        :class:`ExpiredContinuation`, which the route renders as HTTP 409. That
+        409 is unretryable by construction — the session it refers to no longer
+        exists — so the client either loses the turn or fails it over to another
+        model, even though nothing is actually wrong with the request.
+
+        Since OpenAI clients are stateless, the continuation carries the entire
+        transcript, so we can just start over: :meth:`create` folds the whole
+        thing (the user turn, the assistant turn with tool_calls, and the tool
+        results) into one fresh turn and Claude produces the next turn — final
+        text or new tool calls — exactly as it would have. Gated by
+        ``settings.rebuild_on_expiry`` so the legacy 409 can be restored.
+        """
+        try:
+            return await self.resume(req)
+        except DuplicateContinuation:
+            # A live conversation already owns this turn: rebuilding would run
+            # it a second time. Always the legacy 409.
+            raise
+        except ExpiredContinuation:
+            if not self.settings.rebuild_on_expiry:
+                raise
+            logger.info(
+                "continuation expired; rebuilding a fresh %s session from full "
+                "history (%d messages) instead of 409",
+                model, len(req.messages),
+            )
+            return await self.create(req, model=model, workdir=workdir, effort=effort)
 
     # ── turn loop ─────────────────────────────────────────────────────────—
 
