@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     suspended_ttl_s: int = 300
     idle_session_ttl_s: int = 900
     gc_interval_s: int = 30
+    # Grace window used by ConversationManager._collect_client_batch to sweep up
+    # a parallel tool call that the first `assistant` stream event did not
+    # announce. Claude dispatches a parallel batch over MCP with a small stagger
+    # (measured 45-57ms on opus), so parking the moment the announced count is
+    # met orphans the straggler. See the comment on _collect_client_batch.
+    # 0 restores the previous park-immediately behaviour.
+    batch_grace_s: float = 0.25
 
     # ── Expired-continuation recovery ──────────────────────────────────────—
     # When a tool continuation references a suspended conversation that is gone

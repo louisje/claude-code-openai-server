@@ -112,6 +112,17 @@ class Conversation:
     current_msgs: list = field(default_factory=list)
     reuse_salt: str = ""
     reuse_key: Optional[str] = None
+    # Events consumed off the session stream by ``_collect_client_batch`` that
+    # ``run_turn`` still has to act on, replayed FIFO before anything new is
+    # read. Two kinds land here:
+    #   * an ``AssistantToolUse`` Claude announced but had not yet dispatched
+    #     over MCP when we had to park — the CLI only issues it once the current
+    #     batch's results come back, and the announcing event never repeats;
+    #   * a terminal ``TurnDone`` that arrived while we were waiting.
+    # Dropping either is what produced the historical failure modes: a late
+    # dispatch became an orphan (→ HTTP 409), or the turn loop was left waiting
+    # on an event that could not arrive (→ hang until the request timeout).
+    deferred_events: list = field(default_factory=list)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -384,12 +395,22 @@ class ConversationManager:
 
         # Any call Claude is still blocked on that this continuation did not
         # answer would hang the subprocess until the request timeout. Fail those
-        # Futures so the turn errors out promptly instead of stalling.
+        # Futures so the turn errors out promptly instead of stalling — unless
+        # they are deferred dispatches (announced before we parked, dispatched
+        # after), which the next turn collects via the replayed announcement.
         missing = outstanding - answered
         if missing:
-            logger.warning("conv=%s partial continuation: %d of %d tool calls unanswered",
-                           conv.conv_id, len(missing), len(outstanding))
-            conv.bridge.fail_all("continuation did not supply all tool results")
+            if conv.deferred_events:
+                # Deferred calls: leave them pending, the next run_turn collects
+                # them from the bridge queue and hands them to the client.
+                logger.info(
+                    "conv=%s leaving %d deferred call(s) pending for the next turn "
+                    "(%d answered)", conv.conv_id, len(missing), len(answered),
+                )
+            else:
+                logger.warning("conv=%s partial continuation: %d of %d tool calls unanswered",
+                               conv.conv_id, len(missing), len(outstanding))
+                conv.bridge.fail_all("continuation did not supply all tool results")
 
         logger.info("conv=%s resumed (%d/%d tool results)", conv.conv_id, resolved, len(tool_msgs))
         return conv
@@ -448,7 +469,15 @@ class ConversationManager:
         # to park a subprocess for the very next turn to reuse.
         try:
             while True:
-                ev = await conv.session.next_event(timeout=timeout)
+                # Drain anything the collector consumed on our behalf before
+                # reading new input: a deferred announcement's dispatch is
+                # normally already queued on the bridge by now.
+                if conv.deferred_events:
+                    ev: object = conv.deferred_events.pop(0)
+                    replayed = isinstance(ev, AssistantToolUse)
+                else:
+                    ev = await conv.session.next_event(timeout=timeout)
+                    replayed = False
                 if ev is None:
                     await self._close(conv)
                     yield ErrorChunk("upstream timeout", status_code=504)
@@ -469,12 +498,32 @@ class ConversationManager:
                         # on a fresh blank line instead of gluing it on.
                         yield ToolBoundaryChunk()
                         continue
-                    batch = await self._collect_client_batch(conv, len(client))
+                    batch = await self._collect_client_batch(
+                        conv,
+                        announced_blocks=list(client),
+                        # A replay is a best-effort second look, so bound it:
+                        # an announcement is a hint, and Claude may simply never
+                        # dispatch it.
+                        initial_deadline_s=(
+                            self._replay_deadline_s() if replayed else None),
+                    )
                     if batch is None:
                         await self._close(conv)
                         yield ErrorChunk("upstream timeout", status_code=504)
                         return
                     if not batch:
+                        if replayed or conv.deferred_events:
+                            # Either the replayed announcement never became a
+                            # real dispatch, or a terminal event overtook it and
+                            # is queued to end the turn properly. Historically
+                            # such an announcement was discarded outright and
+                            # the loop carried on, so tearing the turn down here
+                            # would be the regression.
+                            logger.info(
+                                "conv=%s announcement %s never dispatched; ignoring",
+                                conv.conv_id, [b.id for b in client],
+                            )
+                            continue
                         await self._close(conv)
                         yield ErrorChunk("expected client tool calls did not arrive", status_code=502)
                         return
@@ -530,10 +579,19 @@ class ConversationManager:
                 ev.request_id, {"behavior": ev.cancel_behavior()}
             )
 
+    def _replay_deadline_s(self) -> float:
+        """How long a replayed announcement may wait for its dispatch."""
+        return max(1.0, self.settings.batch_grace_s * 4)
+
     async def _collect_client_batch(
-        self, conv: Conversation, n: int, *, item_timeout: float = 10.0
+        self,
+        conv: Conversation,
+        *,
+        announced_blocks: Optional[list] = None,
+        initial_deadline_s: Optional[float] = None,
+        item_timeout: float = 10.0,
     ) -> Optional[list[PendingCall]]:
-        """Collect the ``n`` client calls Claude just announced via ``tool_use``.
+        """Collect the client calls Claude just announced via ``tool_use``.
 
         Claude does not actually invoke the MCP tool until it gets a
         control_response for the ``can_use_tool`` permission check the CLI
@@ -544,41 +602,159 @@ class ConversationManager:
         for the batch, or the two sides deadlock: the turn loop waiting on the
         bridge, the bridge waiting on a control_response only the turn loop
         can send. Returns ``None`` on a hard stop (timeout/EOF/error); a
-        shorter-than-``n`` list only if ``item_timeout`` elapses with no new
-        arrival, matching the old ``collect_batch`` contract.
+        shorter-than-announced list only if ``item_timeout`` elapses with no
+        new arrival, matching the old ``collect_batch`` contract.
+
+        The announced count is only Claude's *first* announcement, not a
+        reliable total, and two realities break the naive "collect N, then
+        park" reading:
+
+        * A parallel batch is dispatched over MCP with a stagger (measured
+          45-57ms on opus), so a call can arrive just after the quota is met.
+        * Claude Code may announce a batch across several ``assistant`` events
+          (one per tool_use block), and may dispatch them one per turn — the
+          next ``tools/call`` only fires once the current batch's results come
+          back.
+
+        An orphaned dispatch is not a benign miss: it stays in
+        ``bridge._pending``, makes a genuinely-complete continuation look
+        partial, ``resume`` calls ``fail_all`` and poisons the turn, and the
+        *next* continuation is rejected as a :class:`DuplicateContinuation` —
+        HTTP 409 — knocking the client onto its fallback model. A dropped
+        announcement is just as bad: its dispatch has no listener, and the turn
+        loop is left waiting on an event that can never arrive.
+
+        The fix tracks *every* announced block in an ordered ``deferred`` list
+        and matches arrivals to it by order (the announcement and the MCP
+        dispatch carry unrelated ids, so order is the only correlation, exactly
+        as the original ``collect_batch(n)`` implicitly assumed). Whatever is
+        still unmatched at the end is handed to ``conv.deferred_events`` so the
+        next ``run_turn`` collects it, and a terminal ``TurnDone`` is likewise
+        returned rather than consumed. Waiting is bounded by ``batch_grace_s``
+        once the first arrival has landed, so an announcement that outpaces its
+        dispatch (the serial case) can never stall the turn.
         """
         batch: list[PendingCall] = []
         incoming_task: Optional[asyncio.Task] = None
         event_task: Optional[asyncio.Task] = None
+        grace = max(0.0, self.settings.batch_grace_s)
+        # Ordered announcement blocks not yet matched to a dispatch. Every
+        # arrival matches the front of this list; anything left at the end is
+        # re-deferred. Starts with the caller's announced blocks so a replay is
+        # tracked exactly like a fresh announcement.
+        deferred: list = list(announced_blocks or [])
+        seen: set[str] = {b.id for b in deferred if b.id}
+        # Bounds the *discretionary* waiting: None until the first arrival lands
+        # (we always wait for at least one dispatch, as the original code did,
+        # bounded by ``item_timeout``), then every further wait is capped by the
+        # grace window. A replay starts with a longer, still-bounded deadline.
+        deadline: Optional[float] = (
+            time.monotonic() + initial_deadline_s if initial_deadline_s else None
+        )
         try:
-            while len(batch) < n:
+            while True:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    if deferred:
+                        logger.warning(
+                            "conv=%s %d client call(s) announced but only %d dispatched "
+                            "within %.2fs; parking on what arrived",
+                            conv.conv_id, len(deferred) + len(batch), len(batch), grace,
+                        )
+                    break
                 if incoming_task is None:
                     incoming_task = asyncio.ensure_future(conv.bridge.next_incoming())
                 if event_task is None:
                     event_task = asyncio.ensure_future(conv.session.next_event(timeout=item_timeout))
+                wait_timeout = (deadline - now) if deadline is not None else None
                 done, _ = await asyncio.wait(
-                    {incoming_task, event_task}, return_when=asyncio.FIRST_COMPLETED
+                    {incoming_task, event_task},
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if not done:
+                    continue  # deadline expired; the top of the loop reports it
                 if incoming_task in done:
-                    batch.append(incoming_task.result())
+                    arrived = incoming_task.result()
                     incoming_task = None
+                    batch.append(arrived)
+                    had_announcement = bool(deferred)
+                    if deferred:
+                        deferred.pop(0)
+                    # Once we have our first dispatch, any further waiting is
+                    # discretionary: bound it so a serialized dispatch cannot
+                    # stall the turn.
+                    deadline = time.monotonic() + grace
+                    if not had_announcement:
+                        logger.info(
+                            "conv=%s swept a late parallel tool call into the batch (now %d)",
+                            conv.conv_id, len(batch),
+                        )
                 if event_task in done:
                     ev = event_task.result()
                     event_task = None
                     if ev is None:
+                        if not deferred:
+                            break
                         logger.warning(
-                            "conv=%s collect_batch timed out at %d/%d", conv.conv_id, len(batch), n
+                            "conv=%s collect_batch timed out at %d/%d",
+                            conv.conv_id, len(batch), len(deferred) + len(batch),
                         )
                         break
                     if ev is STREAM_CLOSED or isinstance(ev, Error):
                         # Both tasks can land in the same wait round: if the
                         # batch is already complete, the calls are real and the
                         # client can still run them — don't throw them away.
-                        return batch if len(batch) >= n else None
+                        return batch if not deferred else None
+                    if isinstance(ev, TurnDone):
+                        # The turn ended while we were waiting. Nothing further
+                        # will be dispatched, so stop expecting the announced
+                        # calls — but hand the terminal event back, or run_turn
+                        # blocks on a stream that has nothing left to say.
+                        conv.deferred_events.append(ev)
+                        deferred.clear()
+                        break
                     if isinstance(ev, (PermissionRequest, QuestionRequest, ControlDialog)):
                         await self._handle_control_event(conv, ev)
-                    # TextDelta / further AssistantToolUse / others: ignore —
-                    # the batch is what we're here for.
+                    elif isinstance(ev, AssistantToolUse):
+                        # Claude Code emits one ``assistant`` line per tool_use
+                        # block, so a single step announces itself across several
+                        # events and may re-announce blocks we already hold.
+                        # Count only blocks not seen before: raising the quota
+                        # for a duplicate makes the loop wait for a dispatch that
+                        # will never arrive (observed: a 10s hang).
+                        new_blocks = [
+                            b for b in ev.client_calls
+                            if not b.id or b.id not in seen
+                        ]
+                        seen.update(b.id for b in new_blocks if b.id)
+                        if new_blocks:
+                            deferred.extend(new_blocks)
+                            # An announcement is a hint, not a guarantee of a
+                            # dispatch, so stop treating the wait as obligatory.
+                            deadline = time.monotonic() + grace if grace > 0 else None
+                            logger.info(
+                                "conv=%s follow-up tool_use announced %d new client call(s) "
+                                "%s; expected now %d",
+                                conv.conv_id, len(new_blocks),
+                                [b.id for b in new_blocks], len(deferred) + len(batch),
+                            )
+                        else:
+                            logger.debug(
+                                "conv=%s follow-up tool_use re-announced known block(s) %s; "
+                                "quota unchanged", conv.conv_id,
+                                [b.id for b in ev.client_calls],
+                            )
+                    # TextDelta / others: ignore — the batch is what we're here for.
+            if deferred:
+                # Hand the unfulfilled announcement to the next run_turn. The
+                # CLI typically dispatches these only once the current batch's
+                # results come back, and the announcing event never repeats.
+                conv.deferred_events.append(AssistantToolUse(tool_uses=list(deferred)))
+                logger.info(
+                    "conv=%s deferring %d announced-but-undispatched call(s) %s to the next turn",
+                    conv.conv_id, len(deferred), [b.id for b in deferred],
+                )
             return batch
         finally:
             for t in (incoming_task, event_task):
