@@ -26,6 +26,23 @@ from app.routes import chat, compat, health, models
 logger = logging.getLogger("cci")
 
 
+class _DecodeBytesArgs(logging.Filter):
+    """Decode bytes log args to str so non-ASCII prints as text, not \\xNN repr.
+
+    sse_starlette logs raw SSE chunks via ``logger.debug("chunk: %s", chunk)``
+    where ``chunk`` is bytes; ``%s`` on bytes falls back to repr(), which
+    escapes every non-ASCII byte as \\xNN instead of showing the character.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            record.args = tuple(
+                a.decode("utf-8", "replace") if isinstance(a, bytes) else a
+                for a in record.args
+            )
+        return True
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
@@ -33,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("sse_starlette.sse").addFilter(_DecodeBytesArgs())
     logger.info("claude-code-interface starting on %s:%d", settings.host, settings.port)
     logger.info("default model=%s permission_mode=%s workdir=%s mcp_prefix=%s",
                 settings.default_model, settings.permission_mode,
