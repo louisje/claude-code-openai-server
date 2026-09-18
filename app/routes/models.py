@@ -10,21 +10,20 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.config import KNOWN_MODEL_ALIASES
 from app.openai_models import ModelCard, ModelList
 
 router = APIRouter()
 
-# Short aliases first (handy as a client `default_model`), then concrete ids.
-# Concrete ids are limited to current (non-deprecated, non-legacy) models.
+# Short aliases (from config.KNOWN_MODEL_ALIASES, the single source of truth for
+# what the CLI accepts) first, then concrete ids limited to current
+# (non-deprecated, non-legacy) models.
 _MODEL_IDS = [
-    "opus",
-    "sonnet",
-    "haiku",
-    "fable",
-    "claude-opus-4-8",
+    *sorted(KNOWN_MODEL_ALIASES),
+    "claude-opus-5",
     "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
-    "claude-fable-5",
+    "claude-fable-5-1",
 ]
 
 
