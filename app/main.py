@@ -30,14 +30,17 @@ class _DecodeBytesArgs(logging.Filter):
     """Decode bytes log args to str so non-ASCII prints as text, not \\xNN repr.
 
     sse_starlette logs raw SSE chunks via ``logger.debug("chunk: %s", chunk)``
-    where ``chunk`` is bytes; ``%s`` on bytes falls back to repr(), which
-    escapes every non-ASCII byte as \\xNN instead of showing the character.
+    where ``chunk`` is bytes ending in ``\\r\\n\\r\\n``; ``%s`` on bytes falls
+    back to repr() (escaping non-ASCII as \\xNN), and the raw CRLFs otherwise
+    split one log record across multiple lines in the log file. Decode and
+    collapse both away so each record stays on one line.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.args:
             record.args = tuple(
-                a.decode("utf-8", "replace") if isinstance(a, bytes) else a
+                a.decode("utf-8", "replace").replace("\r\n", " ").strip()
+                if isinstance(a, bytes) else a
                 for a in record.args
             )
         return True
